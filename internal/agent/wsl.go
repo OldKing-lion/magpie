@@ -2,7 +2,6 @@ package agent
 
 import (
 	"bufio"
-	"context"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -19,7 +18,6 @@ import (
 	"github.com/yetone/magpie/internal/catalog"
 	"github.com/yetone/magpie/internal/edit"
 	"github.com/yetone/magpie/internal/gateway"
-	"github.com/yetone/magpie/internal/proc"
 	"github.com/yetone/magpie/internal/provider"
 	"github.com/yetone/magpie/internal/sessions"
 	"github.com/yetone/magpie/internal/settings"
@@ -904,14 +902,10 @@ var wslOn = runtime.GOOS == "windows"
 // Settings' Detect agents in WSL is on (#1264).
 func wslLooks() bool { return wslOn && !settings.Load().NoWSLAgents }
 
-// wslRun runs wsl.exe; a var for tests.
+// wslRun runs wsl.exe; a var for tests. With no distro registered it
+// returns without starting wsl.exe, which would open the installer console.
 var wslRun = func(timeout time.Duration, args ...string) ([]byte, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-	cmd := proc.CommandContext(ctx, "wsl.exe", args...)
-	// wsl.exe speaks UTF-16 unless told otherwise; either is read
-	cmd.Env = append(os.Environ(), "WSL_UTF8=1")
-	return cmd.Output()
+	return wslrun.Run(timeout, args...)
 }
 
 // wslRoot is where magpie opens a running distro's / from; a var for tests.

@@ -10,6 +10,7 @@ package wslrun
 import (
 	"bufio"
 	"context"
+	"errors"
 	"net"
 	"net/url"
 	"os"
@@ -40,13 +41,46 @@ type Tool struct {
 // On is whether there is WSL to look in: on Windows, or in tests.
 var On = runtime.GOOS == "windows"
 
-// Run runs wsl.exe and returns what it printed; a var for tests.
+// errNotPresent is Run's answer when wsl.exe must not be started: off
+// Windows, with MAGPIE_WSL=0, with no distro registered, or after the
+// inbox installer prompt was seen.
+var errNotPresent = errors.New("wsl: not present")
+
+// start is the wsl.exe Run launches; a var for tests.
+var start = func(ctx context.Context, args ...string) *exec.Cmd {
+	cmd := proc.CommandContext(ctx, "wsl.exe", args...)
+	// wsl.exe speaks UTF-16 unless told otherwise; either is read
+	cmd.Env = append(os.Environ(), "WSL_UTF8=1")
+	return cmd
+}
+
+// Run runs wsl.exe and returns what it printed; a var for tests. It does
+// not start wsl.exe when Present is false: the inbox wsl.exe, on a machine
+// with no distro, opens a console asking to install WSL.
 var Run = func(timeout time.Duration, args ...string) ([]byte, error) {
+	if !Present() {
+		return nil, errNotPresent
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	cmd := proc.CommandContext(ctx, "wsl.exe", args...)
-	cmd.Env = append(os.Environ(), "WSL_UTF8=1")
-	return cmd.Output()
+	out, err := start(ctx, args...).Output()
+	if installStub(out) {
+		deny()
+		if err == nil {
+			err = errors.New("wsl: installer prompt")
+		}
+		return nil, err
+	}
+	return out, err
+}
+
+// notPresent is a command that never starts, so a caller of Command or
+// Probe does not open the installer console. The name is not wsl.exe, so
+// making the command does not look that program up.
+func notPresent(ctx context.Context) *exec.Cmd {
+	cmd := proc.CommandContext(ctx, "magpie-wsl-not-present")
+	cmd.Err = errNotPresent
+	return cmd
 }
 
 var found struct {
@@ -271,11 +305,17 @@ func onPath(path, dir string) bool {
 // run inside the distro too: killing wsl.exe alone leaves it there (a
 // `claude auth login` would wait on for a browser that never comes).
 func (t Tool) Command(ctx context.Context, args ...string) *exec.Cmd {
+	if !Present() {
+		return notPresent(ctx)
+	}
 	return t.cancelable(proc.CommandContext(ctx, "wsl.exe", t.argv(args)...))
 }
 
 // Probe is Command for a short answer, as proc.ProbeContext runs one.
 func (t Tool) Probe(ctx context.Context, args ...string) *exec.Cmd {
+	if !Present() {
+		return notPresent(ctx)
+	}
 	return t.cancelable(proc.ProbeContext(ctx, "wsl.exe", t.argv(args)...))
 }
 
