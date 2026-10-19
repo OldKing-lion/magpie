@@ -2,7 +2,7 @@
 // files — Claude Code's projects/*/<id>.jsonl (and Qoder's, the same kind),
 // Codex's rollout files, OpenCode's database (or its older JSON files) and
 // ZCode's, Pi's session files and omp's, DeepSeek Harness's, Cline's, Grok
-// Build's, WorkBuddy's, Droid's, Cursor CLI's and Alma's chat stores — with the tokens each spent, what that cost at the
+// Build's, WorkBuddy's and CodeBuddy Code's, Droid's, Cursor CLI's and Alma's chat stores — with the tokens each spent, what that cost at the
 // effective price, and the command that resumes it. It only ever reads the
 // agents' folders.
 //
@@ -118,7 +118,7 @@ type Session struct {
 	// Gateway: seen only through magpie's gateway, with no file of the
 	// agent's on this computer (external.go)
 	Gateway       bool          `json:"gateway,omitempty"`
-	Agent         string        `json:"agent"` // magpie agent id: claude, codex, opencode, pi, omp, zcode, dsh, cline, qoder, qoder-cn, grok, workbuddy, droid, cursor, hermes, alma, kimi
+	Agent         string        `json:"agent"` // magpie agent id: claude, codex, opencode, pi, omp, zcode, dsh, cline, qoder, qoder-cn, grok, workbuddy, codebuddy, droid, cursor, hermes, alma, kimi
 	ID            string        `json:"id"`
 	Cwd           string        `json:"cwd"`
 	Title         string        `json:"title"` // the name it was given, else the agent's own title, else the first prompt
@@ -469,11 +469,18 @@ func ccFiles(agent, dir string) []file {
 }
 
 // allFiles are every agent's session files.
+// filesHook, when a test sets it, runs on each pass over every agent's
+// files.
+var filesHook func()
+
 func allFiles() []file {
+	if filesHook != nil {
+		filesHook()
+	}
 	var out []file
 	for _, fs := range [][]file{callFiles(), openCodeFiles(), piFiles(),
 		wslFiles("pi", "omp", "kimi"), zcodeFiles(), dshFiles(), clineFiles(), ccFiles("qoder", QoderDir("qoder")), ccFiles("qoder-cn", QoderDir("qoder-cn")),
-		grokFiles(), workbuddyFiles(), droidFiles(), ompFiles(), cursorFiles(), hermesFiles(), almaFiles(), kimiFiles()} {
+		grokFiles(), workbuddyFiles(), codebuddyFiles(), droidFiles(), ompFiles(), cursorFiles(), hermesFiles(), almaFiles(), kimiFiles()} {
 		out = append(out, fs...)
 	}
 	return out
@@ -493,6 +500,7 @@ func Dirs() []string {
 		{QoderDir("qoder-cn"), filepath.Join(QoderDir("qoder-cn"), "projects")},
 		{GrokDir(), filepath.Join(GrokDir(), "sessions")},
 		{WorkBuddyDir(), filepath.Join(WorkBuddyDir(), "projects")},
+		{CodeBuddyDir(), filepath.Join(CodeBuddyDir(), "projects")},
 		{OmpDir(), filepath.Join(OmpDir(), "sessions")},
 		{FactoryDir(), filepath.Join(FactoryDir(), "sessions")},
 		{CursorDir(), filepath.Join(CursorDir(), "chats")},
@@ -754,7 +762,7 @@ func refresh(want, all []file) {
 		if f.cold {
 			continue // in a stopped WSL distro: what was read of it stands
 		}
-		if s := cache[f.path]; s == nil || s.Size != f.size || s.Mod != f.mod.UnixNano() || (f.agent == "hermes" && (f.hermes == nil || f.hermes.revision == "" || s.DBRevision != f.hermes.revision)) || ((f.agent == "alma" || f.agent == "cursor") && s.DBRevision != f.rev) {
+		if s := cache[f.path]; s == nil || s.Size != f.size || s.Mod != f.mod.UnixNano() || (f.agent == "hermes" && (f.hermes == nil || f.rev == "" || s.DBRevision != f.rev)) || ((f.agent == "alma" || f.agent == "cursor") && s.DBRevision != f.rev) {
 			todo = append(todo, f)
 		}
 	}
@@ -974,6 +982,7 @@ func Reset() {
 	directoryCache.Unlock()
 	resetCalls()
 	wslReset()
+	forgetHermesPrints()
 	mu.Lock()
 	defer mu.Unlock()
 	saved()
@@ -1039,20 +1048,38 @@ func List(limit int) []Session {
 	return out
 }
 
-// assemble puts a session together from its files' parses.
-func assemble(fs []file, price func(string) *catalog.Price) (Session, bool) {
-	// the session's own file first; for Codex the earliest segment
+// sortSessionFiles puts a session's own file first; for Codex the earliest
+// segment.
+func sortSessionFiles(fs []file) {
 	sort.SliceStable(fs, func(i, j int) bool {
 		if fs[i].main != fs[j].main {
 			return fs[i].main
 		}
 		return filepath.Base(fs[i].path) < filepath.Base(fs[j].path)
 	})
+}
+
+// sessionID is a session's id: its key's, or for an agent that writes it
+// inside the file (idInFile), what its own file's parse read.
+func sessionID(fs []file) string {
+	sortSessionFiles(fs)
+	id := strings.TrimPrefix(fs[0].key, fs[0].agent+":")
+	if idInFile(fs[0].agent) && fs[0].main {
+		if st := cache[fs[0].path]; st != nil && st.ID != "" {
+			id = st.ID
+		}
+	}
+	return id
+}
+
+// assemble puts a session together from its files' parses.
+func assemble(fs []file, price func(string) *catalog.Price) (Session, bool) {
+	sortSessionFiles(fs)
 	s := Session{Agent: fs[0].agent, Path: fs[0].path, Models: []Model{}, WSL: fs[0].wsl}
 	for _, f := range fs {
 		s.ReadOnly = s.ReadOnly || f.readOnly
 	}
-	s.ID = strings.TrimPrefix(fs[0].key, s.Agent+":")
+	s.ID = sessionID(fs)
 	var custom, named, first string
 	models := map[string]*Model{}
 	for _, f := range fs {
@@ -1075,9 +1102,6 @@ func assemble(fs []file, price func(string) *catalog.Price) (Session, bool) {
 			}
 			if first == "" {
 				first = st.First
-			}
-			if (s.Agent == "codex" || s.Agent == "pi" || s.Agent == "omp" || s.Agent == "dsh" || s.Agent == "grok" || s.Agent == "droid") && st.ID != "" && f.path == fs[0].path {
-				s.ID = st.ID
 			}
 		}
 		if s.Agent == "codex" && st.CodexNickname != "" {
@@ -1175,7 +1199,7 @@ func parserFor(agent string) sessionParser {
 		return sessionParser{line: codexBody}
 	case "pi", "omp":
 		return sessionParser{line: piParse}
-	case "workbuddy":
+	case "workbuddy", "codebuddy":
 		return sessionParser{line: workbuddyLine}
 	default:
 		return sessionParser{line: claudeLine, claude: true}
@@ -1219,7 +1243,7 @@ func parse(f file, old *state) *state {
 	if err == nil {
 		s.Off = off
 	}
-	if f.agent == "workbuddy" && s.Cwd == "" {
+	if isBuddy(f.agent) && s.Cwd == "" {
 		workbuddyMeta(s, f.path)
 	}
 	return s
@@ -1240,6 +1264,9 @@ func scan(path string, off int64, fn func([]byte)) (int64, error) {
 // to is stepped over without being gathered (most of a Codex rollout's
 // bytes are lines no one reads: compactions, tool output). A nil head
 // wants every line.
+// scanHook, when a test sets it, is told where each scan of a file starts.
+var scanHook func(path string, off int64)
+
 func scanHead(path string, off int64, head func([]byte) bool, fn func([]byte)) (int64, error) {
 	return scanAt(path, off, head, func(b []byte, _, _ int64) bool { fn(b); return true })
 }
@@ -1250,6 +1277,9 @@ func scanHead(path string, off int64, head func([]byte) bool, fn func([]byte)) (
 // A compressed file's places are those of its lines decompressed; it is read
 // from its start, what comes before off passed over.
 func scanAt(path string, off int64, head func([]byte) bool, fn func(b []byte, start, end int64) bool) (int64, error) {
+	if scanHook != nil {
+		scanHook(path, off)
+	}
 	f, err := openLines(path)
 	if err != nil {
 		return off, err
@@ -1418,6 +1448,14 @@ func priceOf(s settings.Settings, model string) (catalog.Price, bool) {
 			return pr, true
 		}
 	}
+	// Grok Build's fast variant (grok-4.7-build-fast), which only the Grok
+	// CLI names, at twice its model's price, as a Grok account's call on it
+	// is (TradingLife on Discord)
+	if base, ok := provider.GrokBuildFast(bare); ok {
+		if pr, ok := catalog.PricedBy(makers(base), base); ok {
+			return pr.Times(provider.GrokFastTimes), true
+		}
+	}
 	return catalog.Price{}, false
 }
 
@@ -1469,6 +1507,10 @@ func resumeCommand(distro, agent, id, cwd, path string) string {
 		run = "qoderclicn --resume " + id
 	case "grok":
 		run = "grok --resume " + id
+	case "codebuddy":
+		// its CLI's -r, --resume [sessionId], one bin of the package's
+		// three (codebuddy, cbc, codebuddy-code)
+		run = "codebuddy --resume " + id
 	case "omp":
 		run = "omp --resume " + id
 		if profile := ompProfile(path); profile != "" {
