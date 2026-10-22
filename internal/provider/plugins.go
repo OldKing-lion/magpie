@@ -45,13 +45,14 @@ const (
 // PluginID is the id magpie gives the provider OpenCode calls id: the same,
 // unless a preset or a built-in subscription has it (google, openai,
 // anthropic), or a provider of the user's own made before the plugin was
-// installed (zenmux, #867), when it is id-plugin — but for a built-in moved
+// installed (zenmux, #867), or "auto" or "group", which start the ids of
+// routing groups, when it is id-plugin — but for a built-in moved
 // onto the plugin, whose id the plugin has now.
 func PluginID(id string) string {
 	if PluginServes(id) {
 		return id
 	}
-	if slices.Contains(accountIDs, id) || Preset(id) != nil || id == "magpie" || customIDs()[id] {
+	if slices.Contains(accountIDs, id) || Preset(id) != nil || id == "magpie" || id == autoID || id == strings.TrimSuffix(GroupPrefix, "/") || customIDs()[id] {
 		return id + "-plugin"
 	}
 	return id
@@ -233,6 +234,10 @@ func pluginCatalog(pp plugin.Provider) []catalog.Model {
 		if c.Name == "" {
 			c.Name = m.ID
 		}
+		// a model that searches the web by itself, asked in plain words
+		if m.Searches {
+			c.WebSearch = "native"
+		}
 		if m.Reasoning {
 			c.Efforts, c.Reasoning = m.Variants, true
 		}
@@ -341,8 +346,9 @@ func pluginProvider(pp plugin.Provider, l pluginLogin) Provider {
 		// Codex's namespaced tools go to Grok flat, as the built-in sends
 		// them (#404): the plugin's own rewrite would leave them out; and
 		// a plain agent_message goes as the user's message, as the plugin
-		// itself sends it from 0.1.11
-		a.body = grokBody
+		// itself sends it from 0.1.11. A lone tool_choice "none" stays,
+		// for the plugin to read (grokPluginBody, #3110)
+		a.body = grokPluginBody
 	}
 	if pp.ID == "zed" {
 		// an OpenAI model's request as Zed's cloud reads it: Codex's
