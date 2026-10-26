@@ -104,6 +104,10 @@ type updateJSON struct {
 	Busy    *gateway.Busy `json:"busy,omitempty"`
 	Waiting bool          `json:"waiting,omitempty"`
 	GaveUp  bool          `json:"gaveUp,omitempty"`
+	// Handover, the restart hands the gateway to the new version
+	// (handover.go): Busy is then the Claude subscription's turns alone,
+	// every other request finishing as the new version takes the next
+	Handover bool `json:"handover,omitempty"`
 }
 
 var updates = &updater{}
@@ -260,6 +264,36 @@ func (u *updater) freshen() {
 	u.mu.Unlock()
 	if stale {
 		u.recheck()
+	}
+}
+
+// An answer of "latest" is about the moment the feed was asked, and magpie
+// releases many times a day: Settings' Version row said 已是最新 on
+// v0.1.1402 with v0.1.1517 out (RickyWei on Discord, Windows), the answer
+// of a check made while 1402 was the newest and never made again (automatic
+// checks off, or once a day). So it is shown only while younger than
+// freshAfter. When the Version row is drawn (GET /api/update?fresh=1) an
+// older one is asked again, with automatic updates on; with them off the
+// row says so, and its Check asks.
+
+// latestStale is whether the state is a "latest" older than freshAfter.
+// The caller holds u.mu.
+func (u *updater) latestStale() bool {
+	return u.state == "latest" && time.Since(u.asked) >= freshAfter
+}
+
+// refreshLatest asks the feed again when the Version row is drawn over a
+// stale "latest", unless automatic updates are off. It doesn't wait for
+// the answer: the row shows checking, and reads again.
+func (u *updater) refreshLatest(s settings.Settings) {
+	if s.NoAutoUpdate {
+		return
+	}
+	u.mu.Lock()
+	stale := u.latestStale()
+	u.mu.Unlock()
+	if stale && u.begin() {
+		go u.run()
 	}
 }
 
@@ -448,7 +482,7 @@ func (u *updater) json() updateJSON { return u.jsonIn("") }
 // Notes held in another language are asked for again in lang, at most
 // once a minute; the page's next look has them.
 func (u *updater) jsonIn(lang string) updateJSON {
-	busy := gatewayBusy()
+	busy, handover := restartBusy(), handsOver()
 	u.mu.Lock()
 	defer u.mu.Unlock()
 	if lang != "" {
@@ -459,6 +493,9 @@ func (u *updater) jsonIn(lang string) updateJSON {
 		}
 	}
 	j := updateJSON{State: u.state, Current: Version, Error: u.err, Retry: u.retry}
+	if u.latestStale() {
+		j.State = "" // not asked lately: no claim to be up to date
+	}
 	if u.state == "error" {
 		j.Mirror = u.mirror
 	}
@@ -482,6 +519,7 @@ func (u *updater) jsonIn(lang string) updateJSON {
 	}
 	if j.State == "ready" || u.waiting {
 		j.Waiting, j.GaveUp = u.waiting, u.gaveUp && !u.waiting
+		j.Handover = handover
 		if busy.Any() {
 			j.Busy = &busy
 		}
@@ -524,6 +562,9 @@ func (u *updater) relang(version, lang string) {
 
 func updateRoutes(mux *http.ServeMux, w Windows) {
 	mux.HandleFunc("GET /api/update", func(rw http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("fresh") == "1" { // the Version row
+			updates.refreshLatest(settings.Load())
+		}
 		writeJSON(rw, updates.jsonIn(askedLang(r)))
 	})
 	// notes: what changed in every release after this one up to the update,
@@ -584,7 +625,7 @@ func updateRoutes(mux *http.ServeMux, w Windows) {
 			if in.When != "now" && !updates.idle() {
 				updates.waitIdle(func() bool {
 					if restartToUpdate(isWeb(w), in.View != "" || mainShown(w), in.View) {
-						go w.Quit()
+						go leave(w.Quit)
 						return true
 					}
 					return false
@@ -599,7 +640,7 @@ func updateRoutes(mux *http.ServeMux, w Windows) {
 		case j.State == "ready":
 			if restartToUpdate(isWeb(w), in.View != "" || mainShown(w), in.View) {
 				rw.WriteHeader(http.StatusNoContent)
-				go w.Quit()
+				go leave(w.Quit)
 				return
 			}
 		case j.State == "error" && j.Retry, j.State == "found":
@@ -629,6 +670,9 @@ func restartToUpdate(web, window bool, view string) bool {
 // (#2096), and the Mac's new one too opens only its menu bar icon when no
 // window was up, rather than putting up one the user had closed.
 func restartInto(web, window bool, view string, bySelf bool) bool {
+	if pending.Load() != nil {
+		return false // a handover under way restarts already
+	}
 	bundle, exe := updates.bundle, updates.exe
 	updates.mu.Lock()
 	version := ""
@@ -642,6 +686,12 @@ func restartInto(web, window bool, view string, bySelf bool) bool {
 	updatedInApp(version) // its first start leaves the notes to Settings (#525)
 	if web {
 		webReexec.Store(true)
+		return true
+	}
+	// on a Mac or Linux the new version takes the gateway over while this
+	// one finishes its requests (handover.go)
+	if bundle != "" && beginHandover(bundle, "", window || !bySelf, "") ||
+		bundle == "" && beginHandover("", exe, window, view) {
 		return true
 	}
 	var err error
